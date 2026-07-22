@@ -11,7 +11,7 @@ lsof -ti :5173 | xargs kill -9 2>/dev/null
 echo "Checking Backend Dependencies..."
 cd backend
 python3 -m pip install -r requirements.txt
-python3 -m pip install bcrypt==3.1.7 # Specific fix for passlib compatibility
+python3 -m pip install bcrypt==3.2.2 # Specific fix for passlib compatibility
 
 echo "Launching Backend (Port 8000)..."
 python3 main.py &

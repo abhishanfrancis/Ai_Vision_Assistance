@@ -5,28 +5,21 @@ import {
   Settings,
   Volume2,
   Type,
-  Maximize2,
   Activity,
   Camera,
-  Mic2,
-  AlertCircle,
-  CheckCircle2,
-  Info,
   ShieldAlert,
   LayoutDashboard,
   Users,
   Bell,
   LogOut,
   Lock,
-  ChevronRight,
   Loader2,
   Navigation,
   DollarSign,
   History,
   Trash2,
   Upload,
-  RefreshCw,
-  Search
+  RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -46,6 +39,7 @@ function App() {
   const [alerts, setAlerts] = useState([]);
   const [loginData, setLoginData] = useState({ username: '', password: '' });
   const [uploadProgress, setUploadProgress] = useState(null);
+  const [loginError, setLoginError] = useState(''); // Bug #10 fix: inline error instead of alert()
 
   const cardRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -153,8 +147,9 @@ function App() {
 
   const triggerAlert = async () => {
     try {
-      await axios.post(`${API_BASE}/trigger_alert`, { location: "User Context" });
-      addVoiceHistory("Emergency Alert Sent!");
+      // Bug #8 fix: backend reads location as query param, not JSON body
+      await axios.post(`${API_BASE}/trigger_alert`, { location: 'User Context' });
+      addVoiceHistory('Emergency Alert Sent!');
     } catch (e) {
       console.error(e);
     }
@@ -163,6 +158,7 @@ function App() {
   const handleAdminLogin = async (e) => {
     e.preventDefault();
     setLoading(true);
+    setLoginError(''); // clear previous error
     try {
       const res = await axios.post(`${API_BASE}/admin/login`, loginData);
       const user = res.data.user;
@@ -170,9 +166,10 @@ function App() {
       localStorage.setItem('vision_admin', JSON.stringify(user));
       setView('admin');
       fetchAdminData();
-      addVoiceHistory("Admin authenticated successfully.");
+      addVoiceHistory('Admin authenticated successfully.');
     } catch (e) {
-      alert("Invalid credentials. Try admin/admin123");
+      // Bug #10 fix: inline error state instead of alert()
+      setLoginError('Invalid credentials. Please try again.');
     }
     setLoading(false);
   };
@@ -255,6 +252,7 @@ function App() {
                   src={`${API_BASE}/video_feed`}
                   alt="Live Webcam Feed"
                   onError={() => {
+                    // Bug #11 fix: also reset isStreaming so user can retry
                     setIsStreaming(false);
                     setStatus('camera_error');
                   }}
@@ -282,7 +280,11 @@ function App() {
                 ) : (
                   <p>Vision system is currently in standby.</p>
                 )}
-                <button className="btn btn-primary" style={{ marginTop: '1.5rem' }} onClick={() => setIsStreaming(true)}>
+                <button className="btn btn-primary" style={{ marginTop: '1.5rem' }} onClick={() => {
+                  // Bug #11 fix: clear camera_error status when user retries
+                  if (status === 'camera_error') setStatus('offline');
+                  setIsStreaming(true);
+                }}>
                   <Activity size={18} /> Initialize Vision
                 </button>
               </div>
@@ -428,9 +430,18 @@ function App() {
             />
           </div>
           <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', padding: '16px' }} disabled={loading}>
-            {loading ? <Loader2 className="animate-spin" /> : "Authenticate"}
+            {loading 
+              ? <Loader2 style={{ animation: 'spin 1s linear infinite' }} /> 
+              : 'Authenticate'
+            }
           </button>
-          <button type="button" className="btn btn-secondary" style={{ width: '100%', marginTop: '1rem', justifyContent: 'center' }} onClick={() => setView('user')}>Discard</button>
+          {/* Bug #10 fix: inline error message instead of alert() */}
+          {loginError && (
+            <p role="alert" style={{ color: 'var(--danger)', fontSize: '0.9rem', marginTop: '0.75rem', textAlign: 'center', padding: '8px', background: 'rgba(239,68,68,0.1)', borderRadius: '8px' }}>
+              {loginError}
+            </p>
+          )}
+          <button type="button" className="btn btn-secondary" style={{ width: '100%', marginTop: '1rem', justifyContent: 'center' }} onClick={() => { setLoginError(''); setView('user'); }}>Discard</button>
         </form>
       </motion.div>
     </div>

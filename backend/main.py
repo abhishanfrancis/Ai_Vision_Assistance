@@ -9,7 +9,8 @@ import threading
 import os
 import time
 import numpy as np
-from sqlmodel import Field, SQLModel, create_engine, Session, select
+from sqlmodel import Field, SQLModel, create_engine, Session, select, col
+from sqlalchemy import text
 from datetime import datetime
 from typing import Optional, List
 from passlib.context import CryptContext
@@ -139,10 +140,17 @@ async def generate_frames():
     global camera_initialized
     last_speak_time = 0
     detected_objects = set()
-    
+
+    # Performance: cache YOLO results and reuse across frames
+    cached_detections = []       # list of detection dicts
+    frame_counter = 0
+    YOLO_EVERY_N_FRAMES = 5      # only run YOLO inference every 5 frames
+    INFERENCE_WIDTH = 640        # resize to this width for YOLO (keeps aspect ratio)
+    JPEG_QUALITY = 70            # lower quality = smaller payload = faster stream
+
     while True:
         if not camera or not camera.isOpened():
-            time.sleep(1)
+            await asyncio.sleep(1)
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + b'' + b'\r\n')
             continue
@@ -151,93 +159,101 @@ async def generate_frames():
         if not success:
             camera_initialized = False
             break
-        
+
         camera_initialized = True
-        # Run inference
-        results = model(frame, verbose=False)[0]
-        
-        current_detected = []
-        for box in results.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            label = model.names[int(box.cls[0])]
-            conf = float(box.conf[0])
-            
-            if conf > 0.45:
-                # Calculate position
-                center_x = (x1 + x2) / 2
-                frame_width = frame.shape[1]
-                frame_height = frame.shape[0]
-                
-                if center_x < frame_width / 3:
-                    pos = "on the left"
-                elif center_x > (frame_width / 3) * 2:
-                    pos = "on the right"
-                else:
-                    pos = "in the center"
+        frame_counter += 1
 
-                # Distance Estimation (Heuristic based on box area vs frame area)
-                box_area = (x2 - x1) * (y2 - y1)
-                frame_area = frame_width * frame_height
-                area_ratio = box_area / frame_area
-                
-                # Simplified distance: Higher ratio = Closer
-                if area_ratio > 0.3:
-                    distance = "very close"
-                    is_obstacle = True
-                elif area_ratio > 0.1:
-                    distance = "nearby"
-                    is_obstacle = False
-                else:
-                    distance = "far away"
-                    is_obstacle = False
+        # --- PERFORMANCE FIX: Only run YOLO every N frames ---
+        if frame_counter % YOLO_EVERY_N_FRAMES == 0:
+            # Resize frame for faster inference (YOLO sees smaller image)
+            h, w = frame.shape[:2]
+            scale = INFERENCE_WIDTH / w
+            inference_h = int(h * scale)
+            small_frame = cv2.resize(frame, (INFERENCE_WIDTH, inference_h))
 
-                # Currency Recognition (Simplified Label Extension)
-                # In real scenario, we'd use a specific model, but here we can check OCR if it's a 'paper' or broad object
-                if label in ["paper", "card", "cell phone"]: 
-                    # Potential for refinement - checking for currency shapes/colors
-                    pass
+            results = model(small_frame, verbose=False)[0]
 
-                color = (99, 102, 241)
-                if is_obstacle:
-                    color = (239, 68, 68) # Red for obstacles
-                    cv2.putText(frame, "OBSTACLE", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            new_detections = []
+            for box in results.boxes:
+                conf = float(box.conf[0])
+                is_obstacle = False
+                if conf > 0.45:
+                    # Scale box coords back to original resolution
+                    x1, y1, x2, y2 = box.xyxy[0]
+                    x1 = int(x1 / scale); y1 = int(y1 / scale)
+                    x2 = int(x2 / scale); y2 = int(y2 / scale)
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.rectangle(frame, (x1, y1 - 25), (x1 + 100, y1), color, -1)
-                cv2.putText(frame, f"{label} - {distance}", (x1 + 5, y1 - 7), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
-                current_detected.append({"label": label, "pos": pos, "distance": distance, "is_obstacle": is_obstacle})
+                    label = model.names[int(box.cls[0])]
+                    center_x = (x1 + x2) / 2
 
-        # Logic to speak ONLY when something NEW is shown or obstacles are near
-        current_labels = set([d["label"] for d in current_detected])
-        new_labels = current_labels - detected_objects
-        near_obstacles = [d for d in current_detected if d["is_obstacle"]]
-        
-        if (new_labels or near_obstacles) and (time.time() - last_speak_time > 4):
-            phrase = ""
-            if near_obstacles:
-                phrase = f"Warning! {near_obstacles[0]['label']} is very close {near_obstacles[0]['pos']}. "
-            
-            if new_labels:
-                item = next(d for d in current_detected if d["label"] in new_labels)
-                phrase += f"I see a {item['label']} {item['pos']} about {item['distance']}."
-            
-            if phrase:
-                speak(phrase)
-                last_speak_time = time.time()
-                # Log activity to DB
-                with Session(engine) as session:
-                    log = ActivityLog(action="Object Detection", details=phrase)
-                    session.add(log)
-                    session.commit()
+                    if center_x < w / 3:
+                        pos = "on the left"
+                    elif center_x > (w / 3) * 2:
+                        pos = "on the right"
+                    else:
+                        pos = "in the center"
+
+                    box_area = (x2 - x1) * (y2 - y1)
+                    frame_area = w * h
+                    area_ratio = box_area / frame_area
+
+                    if area_ratio > 0.3:
+                        distance = "very close"
+                        is_obstacle = True
+                    elif area_ratio > 0.1:
+                        distance = "nearby"
+                    else:
+                        distance = "far away"
+
+                    new_detections.append({
+                        "label": label, "pos": pos, "distance": distance,
+                        "is_obstacle": is_obstacle,
+                        "box": (x1, y1, x2, y2)
+                    })
+
+            cached_detections = new_detections
+
+            # Speech / DB logging logic (only fires on detection frames)
+            current_labels = set(d["label"] for d in cached_detections)
+            new_labels = current_labels - detected_objects
+            near_obstacles = [d for d in cached_detections if d["is_obstacle"]]
+
+            if (new_labels or near_obstacles) and (time.time() - last_speak_time > 4):
+                phrase = ""
+                if near_obstacles:
+                    phrase = f"Warning! {near_obstacles[0]['label']} is very close {near_obstacles[0]['pos']}. "
+                if new_labels:
+                    item = next(d for d in cached_detections if d["label"] in new_labels)
+                    phrase += f"I see a {item['label']} {item['pos']} about {item['distance']}."
+                if phrase:
+                    speak(phrase)
+                    last_speak_time = time.time()
+                    with Session(engine) as session:
+                        log = ActivityLog(action="Object Detection", details=phrase)
+                        session.add(log)
+                        session.commit()
 
             detected_objects = current_labels
 
-        ret, buffer = cv2.imencode('.jpg', frame)
+        # --- Draw cached detections on every frame (no YOLO cost) ---
+        for det in cached_detections:
+            x1, y1, x2, y2 = det["box"]
+            color = (239, 68, 68) if det["is_obstacle"] else (99, 102, 241)
+            if det["is_obstacle"]:
+                cv2.putText(frame, "OBSTACLE", (x1, y2 + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(frame, (x1, y1 - 25), (x1 + 130, y1), color, -1)
+            cv2.putText(frame, f"{det['label']} - {det['distance']}",
+                        (x1 + 5, y1 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Encode at reduced quality for faster streaming
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+        ret, buffer = cv2.imencode('.jpg', frame, encode_params)
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
 
 @app.get("/video_feed")
 async def video_feed():
@@ -355,10 +371,51 @@ async def read_text():
         speak("I couldn't detect any clear text. Please hold the object steady and ensure there is good lighting.")
         return {"text": "", "message": "No text detected"}
 
+async def _run_ocr_and_currency():
+    """Bug #5 fix: shared internal helper to avoid calling endpoint functions directly."""
+    if not camera or not camera.isOpened():
+        speak("Camera is not available.")
+        return {"error": "Camera error", "text": "Camera disconnected"}
+    success, frame = camera.read()
+    if not success:
+        return {"error": "Capture error", "text": "Failed to read frame"}
+    if reader:
+        speak("Analyzing for currency...")
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        results = reader.readtext(enhanced)
+        text = " ".join([res[1] for res in results])
+    else:
+        text = "OCR model not loaded."
+    return text
+
 @app.get("/identify_currency")
 async def identify_currency():
-    # Similar to read_text but specialized for currency
-    return await read_text()
+    text = await _run_ocr_and_currency()
+    if isinstance(text, dict):  # error dict returned
+        return text
+    currency_keywords = ["dollars", "rupees", "euro", "pounds", "$", "₹", "€", "£", "10", "20", "50", "100", "200", "500", "2000"]
+    is_currency = any(kw in text.lower() for kw in currency_keywords)
+    denom = "currency"
+    for kw in ["10", "20", "50", "100", "200", "500", "2000"]:
+        if kw in text:
+            denom = f"{kw} unit note"
+            break
+    if text.strip():
+        if is_currency:
+            msg = f"This appears to be a {denom}."
+        else:
+            msg = f"No currency detected. Text found: {text}"
+        speak(msg)
+        with Session(engine) as session:
+            log = ActivityLog(action="Currency Recognition", details=f"Detected: {text[:200]}")
+            session.add(log)
+            session.commit()
+        return {"text": text, "is_currency": is_currency}
+    else:
+        speak("I couldn't detect any currency or text. Please hold the note steady with good lighting.")
+        return {"text": "", "message": "No text detected"}
 
 # --- Admin API ---
 class LoginRequest(BaseModel):
@@ -376,7 +433,8 @@ async def admin_login(req: LoginRequest):
 @app.get("/admin/logs")
 async def get_logs():
     with Session(engine) as session:
-        logs = session.exec(select(ActivityLog).order_by(ActivityLog.timestamp.desc()).limit(100)).all()
+        # Bug #6 fix: use col() for proper SQLModel ordering
+        logs = session.exec(select(ActivityLog).order_by(col(ActivityLog.timestamp).desc()).limit(100)).all()
         return logs
 
 @app.get("/admin/users")
@@ -391,10 +449,14 @@ async def get_alerts():
         alerts = session.exec(select(EmergencyAlert).order_by(EmergencyAlert.timestamp.desc())).all()
         return alerts
 
+class AlertRequest(BaseModel):
+    location: str = "Unknown"
+
 @app.post("/trigger_alert")
-async def trigger_alert(location: str = "Unknown"):
+async def trigger_alert(req: AlertRequest):
+    # Bug #1 fix: accept location from JSON body instead of query param
     with Session(engine) as session:
-        alert = EmergencyAlert(location=location)
+        alert = EmergencyAlert(location=req.location)
         session.add(alert)
         session.commit()
     speak("Emergency alert triggered. Admin has been notified.")
@@ -495,7 +557,8 @@ async def delete_user(user_id: int):
 @app.post("/admin/clear_logs")
 async def clear_logs():
     with Session(engine) as session:
-        session.exec(ActivityLog.__table__.delete())
+        # Bug #2 fix: SQLModel-incompatible delete — use sqlalchemy text() instead
+        session.exec(text("DELETE FROM activitylog"))
         session.commit()
         return {"message": "Logs cleared"}
 
