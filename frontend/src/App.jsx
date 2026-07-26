@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
+import { supabase } from '../../src/lib/supabase.js';
 import {
   Eye,
   Settings,
@@ -60,6 +61,16 @@ function App() {
   const [aiResponse, setAiResponse] = useState('');
 
   useEffect(() => {
+    const initSupabaseSession = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.user) {
+        setAdminUser({ username: session.user.email || 'supabase-user', id: session.user.id });
+        setView('admin');
+      }
+    };
+
+    initSupabaseSession();
+
     // Check for existing admin session
     const savedAdmin = localStorage.getItem('vision_admin');
     if (savedAdmin) {
