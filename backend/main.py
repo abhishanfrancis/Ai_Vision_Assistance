@@ -90,29 +90,91 @@ speech_settings = {
     "narrator_mode": True # If true, speaks full sentences
 }
 
-# Thread lock for TTS
-tts_lock = threading.Lock()
+# --- Mode control: only one feature active at a time ---
+VALID_MODES = {"idle", "scene_check", "read_text", "identify_item", "currency", "sos"}
+current_mode = "idle"
+
+
+import queue
+
+try:
+    import pythoncom
+except ImportError:
+    pythoncom = None
+
+
+class SpeechManager:
+    """Centralized TTS manager using a dedicated worker thread and queue.
+    
+    Prevents COM thread initialization crashes on Windows and guarantees
+    thread-safe TTS execution and queue cancellation.
+    """
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._worker = threading.Thread(target=self._loop, daemon=True)
+        self._worker.start()
+
+    def _loop(self):
+        if pythoncom:
+            try:
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+        
+        try:
+            local_engine = pyttsx3.init()
+        except Exception as e:
+            print(f"pyttsx3 init error: {e}")
+            local_engine = None
+
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            text, rate, volume = item
+            if speech_settings["enabled"] and local_engine:
+                try:
+                    local_engine.setProperty('rate', rate)
+                    local_engine.setProperty('volume', volume)
+                    local_engine.say(text)
+                    local_engine.runAndWait()
+                except Exception as e:
+                    print(f"TTS Error: {e}")
+                    try:
+                        local_engine = pyttsx3.init()
+                    except Exception:
+                        pass
+            self._queue.task_done()
+
+    def stop(self):
+        """Clear pending queued speech."""
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                break
+
+    def speak(self, text: str):
+        """Clear pending speech and queue new text."""
+        if not speech_settings["enabled"]:
+            return
+        self.stop()
+        self._queue.put((text, speech_settings["rate"], speech_settings["volume"]))
+
+
+speech_manager = SpeechManager()
+
 
 def speak(text: str):
-    if not speech_settings["enabled"]:
-        return
-        
-    def _run():
-        with tts_lock:
-            try:
-                local_engine = pyttsx3.init()
-                local_engine.setProperty('rate', speech_settings["rate"])
-                local_engine.setProperty('volume', speech_settings["volume"])
-                local_engine.say(text)
-                local_engine.runAndWait()
-            except Exception as e:
-                print(f"TTS Error: {e}")
-    
-    threading.Thread(target=_run, daemon=True).start()
+    """Convenience wrapper so existing call-sites keep working."""
+    speech_manager.speak(text)
+
 
 # Initial welcome
 try:
-    speak("AI Assistant is ready. I will now explain what I see in the camera view.")
+    speak("AI Assistant is ready.")
 except:
     pass
 
@@ -213,27 +275,32 @@ async def generate_frames():
 
             cached_detections = new_detections
 
-            # Speech / DB logging logic (only fires on detection frames)
-            current_labels = set(d["label"] for d in cached_detections)
-            new_labels = current_labels - detected_objects
-            near_obstacles = [d for d in cached_detections if d["is_obstacle"]]
+            # Bug 3 fix: only narrate when scene_check is the active mode
+            if current_mode == "scene_check":
+                current_labels = set(d["label"] for d in cached_detections)
+                new_labels = current_labels - detected_objects
+                near_obstacles = [d for d in cached_detections if d["is_obstacle"]]
 
-            if (new_labels or near_obstacles) and (time.time() - last_speak_time > 4):
-                phrase = ""
-                if near_obstacles:
-                    phrase = f"Warning! {near_obstacles[0]['label']} is very close {near_obstacles[0]['pos']}. "
-                if new_labels:
-                    item = next(d for d in cached_detections if d["label"] in new_labels)
-                    phrase += f"I see a {item['label']} {item['pos']} about {item['distance']}."
-                if phrase:
-                    speak(phrase)
-                    last_speak_time = time.time()
-                    with Session(engine) as session:
-                        log = ActivityLog(action="Object Detection", details=phrase)
-                        session.add(log)
-                        session.commit()
+                if (new_labels or near_obstacles) and (time.time() - last_speak_time > 4):
+                    phrase = ""
+                    if near_obstacles:
+                        phrase = f"Warning! {near_obstacles[0]['label']} is very close {near_obstacles[0]['pos']}. "
+                    if new_labels:
+                        item = next(d for d in cached_detections if d["label"] in new_labels)
+                        phrase += f"I see a {item['label']} {item['pos']} about {item['distance']}."
+                    if phrase:
+                        speak(phrase)
+                        last_speak_time = time.time()
+                        with Session(engine) as session:
+                            log = ActivityLog(action="Object Detection", details=phrase)
+                            session.add(log)
+                            session.commit()
 
-            detected_objects = current_labels
+                detected_objects = current_labels
+            else:
+                # Reset detected objects when not in scene_check so
+                # re-entering the mode narrates what is currently visible
+                detected_objects = set()
 
         # --- Draw cached detections on every frame (no YOLO cost) ---
         for det in cached_detections:
@@ -277,8 +344,30 @@ async def update_settings(settings: SpeechSettings):
     speech_settings["narrator_mode"] = settings.narrator_mode
     return {"message": "Settings updated", "current": speech_settings}
 
+
+# --- Mode & Speech control endpoints (Bug 1-3, 6) ---
+class ModeRequest(BaseModel):
+    mode: str
+
+@app.post("/set_mode")
+async def set_mode(req: ModeRequest):
+    """Switch the active feature mode. Stops any running speech."""
+    global current_mode
+    if req.mode not in VALID_MODES:
+        return JSONResponse(status_code=400, content={"error": f"Invalid mode: {req.mode}"})
+    speech_manager.stop()
+    current_mode = req.mode
+    return {"mode": current_mode}
+
+@app.post("/stop_speech")
+async def stop_speech():
+    """Immediately cancel any running TTS output."""
+    speech_manager.stop()
+    return {"status": "stopped"}
+
 @app.get("/describe_scene")
 async def describe_scene():
+    speech_manager.stop()  # Bug 1/2: cancel any prior speech
     if not camera or not camera.isOpened():
         speak("Camera is offline.")
         return {"description": "Camera is offline."}
@@ -322,6 +411,7 @@ except Exception as e:
 
 @app.post("/read_text")
 async def read_text():
+    speech_manager.stop()  # Bug 1/2: cancel any prior speech
     if not camera or not camera.isOpened():
         speak("Camera is not available.")
         return {"error": "Camera error", "text": "Camera disconnected"}
@@ -373,6 +463,7 @@ async def read_text():
 
 async def _run_ocr_and_currency():
     """Bug #5 fix: shared internal helper to avoid calling endpoint functions directly."""
+    speech_manager.stop()  # Bug 1/2: cancel any prior speech
     if not camera or not camera.isOpened():
         speak("Camera is not available.")
         return {"error": "Camera error", "text": "Camera disconnected"}
@@ -464,6 +555,7 @@ async def trigger_alert(req: AlertRequest):
 
 @app.get("/describe_bottle")
 async def describe_bottle():
+    speech_manager.stop()  # Bug 1/2: cancel any prior speech
     if not camera or not camera.isOpened():
         return {"error": "Camera offline"}
     

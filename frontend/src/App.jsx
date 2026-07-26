@@ -33,6 +33,13 @@ function App() {
   const [adminUser, setAdminUser] = useState(null);
   const [voiceHistory, setVoiceHistory] = useState([]);
 
+  // Bug 4/6: track which feature is currently active
+  const [activeFeature, setActiveFeature] = useState('idle');
+  // Bug 5: per-feature loading message
+  const [featureLoading, setFeatureLoading] = useState('');
+  // Ref to cancel in-flight API requests when switching features
+  const abortControllerRef = useRef(null);
+
   // Admin Data
   const [logs, setLogs] = useState([]);
   const [users, setUsers] = useState([]);
@@ -69,14 +76,22 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  const speakInBrowser = (text, settings = speechSettings) => {
+    if (!('speechSynthesis' in window)) return;
+    window.speechSynthesis.cancel();
+    if (!settings.enabled || !text || text.trim() === '') return;
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = Math.max(0.5, Math.min(2.0, (settings.rate || 150) / 150));
+    utterance.volume = settings.volume !== undefined ? settings.volume : 0.9;
+    window.speechSynthesis.speak(utterance);
+  };
+
   const checkBackend = async () => {
     try {
       const res = await axios.get(`${API_BASE}/status`);
       if (res.data.status === 'online') {
         setStatus(res.data.camera === 'connected' ? 'online' : 'camera_error');
-        if (res.data.speech) {
-          setSpeechSettings(res.data.speech);
-        }
       }
     } catch (e) {
       setStatus('offline');
@@ -85,6 +100,9 @@ function App() {
 
   const updateSpeechSettings = async (newSettings) => {
     setSpeechSettings(newSettings);
+    if (!newSettings.enabled && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
     try {
       await axios.post(`${API_BASE}/settings`, newSettings);
     } catch (e) {
@@ -95,60 +113,94 @@ function App() {
   const addVoiceHistory = (text) => {
     setVoiceHistory(prev => [{ text, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 10));
     setAiResponse(text);
+    speakInBrowser(text);
   };
 
-  const handleReadText = async () => {
-    setLoading(true);
-    setAiResponse("Analyzing text...");
-    try {
-      const res = await axios.post(`${API_BASE}/read_text`);
-      addVoiceHistory(res.data.text || "No text detected.");
-    } catch (e) {
-      addVoiceHistory("OCR request failed.");
+  /**
+   * Bug 1-3, 6: Centralized feature switch.
+   * Cancels any in-flight API request, stops backend speech,
+   * sets the backend mode, and updates frontend state.
+   */
+  const switchFeature = async (mode, loadingMsg = '') => {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
     }
-    setLoading(false);
-  };
+    // Cancel any in-flight HTTP request from the previous feature
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    abortControllerRef.current = new AbortController();
 
-  const handleCurrency = async () => {
-    setLoading(true);
-    setAiResponse("Scanning for currency...");
+    // Stop backend speech + set mode (fire-and-forget, don't block UI)
     try {
-      const res = await axios.get(`${API_BASE}/identify_currency`);
-      addVoiceHistory(res.data.text || "Could not identify currency.");
-    } catch (e) {
-      addVoiceHistory("Currency recognition failed.");
-    }
-    setLoading(false);
+      await Promise.all([
+        axios.post(`${API_BASE}/stop_speech`),
+        axios.post(`${API_BASE}/set_mode`, { mode })
+      ]);
+    } catch (_) { /* backend may be briefly unreachable */ }
+
+    setActiveFeature(mode);
+    setLoading(true);
+    setFeatureLoading(loadingMsg);
+    setAiResponse(loadingMsg);
+
+    return abortControllerRef.current.signal;
   };
 
   const handleDescribeScene = async () => {
-    setLoading(true);
-    setAiResponse("Scanning surroundings...");
+    const signal = await switchFeature('scene_check', 'Scanning surroundings...');
     try {
-      const res = await axios.get(`${API_BASE}/describe_scene`);
+      const res = await axios.get(`${API_BASE}/describe_scene`, { signal });
       addVoiceHistory(res.data.description);
     } catch (e) {
-      addVoiceHistory("Scene analysis failed.");
+      if (!axios.isCancel(e)) addVoiceHistory('Scene analysis failed.');
     }
     setLoading(false);
+    setFeatureLoading('');
+  };
+
+  const handleReadText = async () => {
+    const signal = await switchFeature('read_text', 'Reading text...');
+    try {
+      const res = await axios.post(`${API_BASE}/read_text`, null, { signal });
+      addVoiceHistory(res.data.text || 'No text detected.');
+    } catch (e) {
+      if (!axios.isCancel(e)) addVoiceHistory('OCR request failed.');
+    }
+    setLoading(false);
+    setFeatureLoading('');
+  };
+
+  const handleCurrency = async () => {
+    const signal = await switchFeature('currency', 'Scanning for currency...');
+    try {
+      const res = await axios.get(`${API_BASE}/identify_currency`, { signal });
+      addVoiceHistory(res.data.text || 'Could not identify currency.');
+    } catch (e) {
+      if (!axios.isCancel(e)) addVoiceHistory('Currency recognition failed.');
+    }
+    setLoading(false);
+    setFeatureLoading('');
   };
 
   const handleIdentifyBottle = async () => {
-    setLoading(true);
-    setAiResponse("Identifying object details...");
+    const signal = await switchFeature('identify_item', 'Detecting object...');
     try {
-      const res = await axios.get(`${API_BASE}/describe_bottle`);
+      const res = await axios.get(`${API_BASE}/describe_bottle`, { signal });
       addVoiceHistory(res.data.description || res.data.error);
     } catch (e) {
-      addVoiceHistory("Bottle identification failed.");
+      if (!axios.isCancel(e)) addVoiceHistory('Object identification failed.');
     }
     setLoading(false);
+    setFeatureLoading('');
   };
 
   const triggerAlert = async () => {
+    // SOS doesn't cancel other features — it's an additive emergency action
     try {
-      // Bug #8 fix: backend reads location as query param, not JSON body
+      await axios.post(`${API_BASE}/stop_speech`);
       await axios.post(`${API_BASE}/trigger_alert`, { location: 'User Context' });
+      setActiveFeature('sos');
       addVoiceHistory('Emergency Alert Sent!');
     } catch (e) {
       console.error(e);
@@ -299,19 +351,42 @@ function App() {
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '12px' }}>
-            <button className="btn btn-primary" onClick={handleDescribeScene} disabled={loading}>
-              <Eye size={18} /> Scene Check
+            <button
+              className={`btn ${activeFeature === 'scene_check' ? 'btn-active' : 'btn-secondary'} ${loading && activeFeature === 'scene_check' ? 'btn-loading' : ''}`}
+              onClick={handleDescribeScene}
+              disabled={loading && activeFeature !== 'scene_check'}
+            >
+              {loading && activeFeature === 'scene_check' ? <Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} /> : <Eye size={18} />}
+              {loading && activeFeature === 'scene_check' ? 'Scanning...' : 'Scene Check'}
             </button>
-            <button className="btn btn-secondary" onClick={handleReadText} disabled={loading}>
-              <Type size={18} /> Read Text
+            <button
+              className={`btn ${activeFeature === 'read_text' ? 'btn-active' : 'btn-secondary'} ${loading && activeFeature === 'read_text' ? 'btn-loading' : ''}`}
+              onClick={handleReadText}
+              disabled={loading && activeFeature !== 'read_text'}
+            >
+              {loading && activeFeature === 'read_text' ? <Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} /> : <Type size={18} />}
+              {loading && activeFeature === 'read_text' ? 'Reading...' : 'Read Text'}
             </button>
-            <button className="btn btn-secondary" onClick={handleCurrency} disabled={loading}>
-              <DollarSign size={18} /> Currency
+            <button
+              className={`btn ${activeFeature === 'currency' ? 'btn-active' : 'btn-secondary'} ${loading && activeFeature === 'currency' ? 'btn-loading' : ''}`}
+              onClick={handleCurrency}
+              disabled={loading && activeFeature !== 'currency'}
+            >
+              {loading && activeFeature === 'currency' ? <Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} /> : <DollarSign size={18} />}
+              {loading && activeFeature === 'currency' ? 'Scanning...' : 'Currency'}
             </button>
-            <button className="btn btn-secondary" onClick={handleIdentifyBottle} disabled={loading}>
-              <Navigation size={18} /> Identify Item
+            <button
+              className={`btn ${activeFeature === 'identify_item' ? 'btn-active' : 'btn-secondary'} ${loading && activeFeature === 'identify_item' ? 'btn-loading' : ''}`}
+              onClick={handleIdentifyBottle}
+              disabled={loading && activeFeature !== 'identify_item'}
+            >
+              {loading && activeFeature === 'identify_item' ? <Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} /> : <Navigation size={18} />}
+              {loading && activeFeature === 'identify_item' ? 'Detecting...' : 'Identify Item'}
             </button>
-            <button className="btn btn-danger" onClick={triggerAlert}>
+            <button
+              className={`btn btn-danger ${activeFeature === 'sos' ? 'btn-active' : ''}`}
+              onClick={triggerAlert}
+            >
               <ShieldAlert size={18} /> SOS Alert
             </button>
           </div>
@@ -365,7 +440,19 @@ function App() {
               />
             </div>
 
-            <button className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center' }} onClick={async () => await axios.get(`${API_BASE}/test_speech`)}>
+            <button
+              className="btn btn-secondary"
+              style={{ width: '100%', justifyContent: 'center' }}
+              onClick={async () => {
+                const msg = "Testing the AI Vision Assist audio feedback system.";
+                speakInBrowser(msg);
+                try {
+                  await axios.get(`${API_BASE}/test_speech`);
+                } catch (e) {
+                  console.error(e);
+                }
+              }}
+            >
               Test Voice Modules
             </button>
           </div>
